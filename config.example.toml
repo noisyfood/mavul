@@ -1,0 +1,29 @@
+control_workers = 4
+device_state_dir = "memory/devices"
+recovery_agent_id = "recovery"
+
+[agents.reverser]
+workspace = "memory/reverser"
+max_concurrency = 2
+
+[agents.reverser.main]
+model = "openai/gpt-5"
+api_key_env = "LLM_API_KEY"
+
+[agents.reverser.worker]
+model = "openai/gpt-5"
+api_key_env = "LLM_API_KEY"
+tool_concurrency_limit = 1
+
+[agents.reverser.mcp_config.ida]
+command = "replace-with-ida-mcp-command"
+args = []
+
+[devices.lab_router]
+name = "Lab router"
+ip_address = "192.0.2.10"
+ssh_port = 22
+
+[devices.lab_router.credential_env]
+username = "LAB_ROUTER_USERNAME"
+password = "LAB_ROUTER_PASSWORD"
