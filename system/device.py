@@ -1,10 +1,9 @@
 import json
-import os
 import threading
 import uuid
 from collections import deque
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -24,7 +23,6 @@ class DeviceEndpoint:
     telnet_port: int | None = None
     ssh_port: int | None = None
     serial_port: str | None = None
-    credential_env: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_mapping(
@@ -37,9 +35,6 @@ class DeviceEndpoint:
         ip_address = config.get("ip_address")
         if not isinstance(ip_address, str) or not ip_address:
             raise ValueError(f"device '{device_id}' requires ip_address")
-        credentials = config.get("credential_env", {})
-        if not isinstance(credentials, Mapping):
-            raise TypeError(f"device '{device_id}' credential_env must be a table")
         return cls(
             device_id=device_id,
             name=str(config.get("name", device_id)),
@@ -47,17 +42,7 @@ class DeviceEndpoint:
             telnet_port=_optional_port(config.get("telnet_port"), "telnet_port"),
             ssh_port=_optional_port(config.get("ssh_port"), "ssh_port"),
             serial_port=_optional_text(config.get("serial_port"), "serial_port"),
-            credential_env=dict(credentials),
         )
-
-    def credentials(self) -> dict[str, str]:
-        missing = [env for env in self.credential_env.values() if not os.getenv(env)]
-        if missing:
-            raise RuntimeError(
-                "missing device credential environment variables: "
-                + ", ".join(sorted(missing))
-            )
-        return {name: os.environ[env] for name, env in self.credential_env.items()}
 
 
 @dataclass(frozen=True)
@@ -65,6 +50,7 @@ class DeviceLease:
     lease_id: uuid.UUID
     device_id: str
     agent_id: str
+    task_id: str
     generation: int
 
 
@@ -91,7 +77,7 @@ class Device:
         self._baseline_root.mkdir(parents=True, exist_ok=True)
         self._baseline_path = self._baseline_root / f"{endpoint.device_id}.json"
         self._lock = threading.RLock()
-        self._waiters: deque[str] = deque()
+        self._waiters: deque[tuple[str, str]] = deque()
         self._lease: DeviceLease | None = None
         self._generation = 0
         self._quarantine_reason: str | None = None
@@ -109,21 +95,28 @@ class Device:
     def acquire(
         self,
         agent_id: str,
+        task_id: str,
         allow_quarantined: bool = False,
     ) -> LeaseRequest:
         if not agent_id:
             raise ValueError("agent_id must not be empty")
+        if not task_id:
+            raise ValueError("task_id must not be empty")
+        owner = (agent_id, task_id)
         with self._lock:
-            if self._lease is not None and self._lease.agent_id == agent_id:
+            if self._lease is not None and (
+                self._lease.agent_id,
+                self._lease.task_id,
+            ) == owner:
                 return LeaseRequest(LeaseStatus.GRANTED, self._lease)
             if self._quarantine_reason is not None:
                 if allow_quarantined and self._lease is None:
-                    return LeaseRequest(LeaseStatus.GRANTED, self._grant(agent_id))
+                    return LeaseRequest(LeaseStatus.GRANTED, self._grant(*owner))
                 return LeaseRequest(LeaseStatus.QUARANTINED)
             if self._lease is None:
-                return LeaseRequest(LeaseStatus.GRANTED, self._grant(agent_id))
-            if agent_id not in self._waiters:
-                self._waiters.append(agent_id)
+                return LeaseRequest(LeaseStatus.GRANTED, self._grant(*owner))
+            if owner not in self._waiters:
+                self._waiters.append(owner)
             return LeaseRequest(LeaseStatus.WAITING)
 
     def release(self, lease: DeviceLease) -> DeviceLease | None:
@@ -132,26 +125,47 @@ class Device:
             self._lease = None
             if self._quarantine_reason is not None or not self._waiters:
                 return None
-            return self._grant(self._waiters.popleft())
+            return self._grant(*self._waiters.popleft())
 
-    def preempt(self, target_agent: str) -> tuple[str | None, DeviceLease]:
+    def cancel_waiter(self, agent_id: str, task_id: str) -> bool:
+        """Cancel one waiting task without affecting the current lease."""
+        if not agent_id:
+            raise ValueError("agent_id must not be empty")
+        if not task_id:
+            raise ValueError("task_id must not be empty")
+        with self._lock:
+            return self._remove_waiter(agent_id, task_id)
+
+    def preempt(
+        self,
+        target_agent: str,
+        target_task_id: str,
+    ) -> tuple[DeviceLease | None, DeviceLease]:
+        if not target_agent:
+            raise ValueError("target_agent must not be empty")
+        if not target_task_id:
+            raise ValueError("target_task_id must not be empty")
+        target = (target_agent, target_task_id)
         with self._lock:
             if self._quarantine_reason is not None:
                 raise RuntimeError("quarantined device cannot be assigned")
-            previous = self._lease.agent_id if self._lease else None
-            if previous == target_agent:
+            previous = self._lease
+            if previous is not None and (
+                previous.agent_id,
+                previous.task_id,
+            ) == target:
                 return previous, self._lease
             if previous is not None:
-                self._waiters.appendleft(previous)
-            self._remove_waiter(target_agent)
+                self._waiters.appendleft((previous.agent_id, previous.task_id))
+            self._remove_waiter(*target)
             self._lease = None
-            return previous, self._grant(target_agent)
+            return previous, self._grant(*target)
 
-    def quarantine(self, reason: str) -> str | None:
+    def quarantine(self, reason: str) -> DeviceLease | None:
         if not reason:
             raise ValueError("quarantine reason must not be empty")
         with self._lock:
-            previous = self._lease.agent_id if self._lease else None
+            previous = self._lease
             self._lease = None
             self._quarantine_reason = reason
             return previous
@@ -160,13 +174,15 @@ class Device:
         with self._lock:
             self._quarantine_reason = None
             if self._lease is None and self._waiters:
-                return self._grant(self._waiters.popleft())
+                return self._grant(*self._waiters.popleft())
             return None
 
     def remove_agent(self, agent_id: str) -> bool:
         """Remove a waiter; quarantine if it still owns this device."""
         with self._lock:
-            self._remove_waiter(agent_id)
+            self._waiters = deque(
+                owner for owner in self._waiters if owner[0] != agent_id
+            )
             if self._lease is None or self._lease.agent_id != agent_id:
                 return False
             self._lease = None
@@ -218,12 +234,13 @@ class Device:
                 temporary.unlink(missing_ok=True)
             return baseline
 
-    def _grant(self, agent_id: str) -> DeviceLease:
+    def _grant(self, agent_id: str, task_id: str) -> DeviceLease:
         self._generation += 1
         self._lease = DeviceLease(
             uuid.uuid4(),
             self.endpoint.device_id,
             agent_id,
+            task_id,
             self._generation,
         )
         return self._lease
@@ -232,11 +249,12 @@ class Device:
         if self._lease != lease:
             raise RuntimeError("device lease is not current")
 
-    def _remove_waiter(self, agent_id: str) -> None:
+    def _remove_waiter(self, agent_id: str, task_id: str) -> bool:
         try:
-            self._waiters.remove(agent_id)
+            self._waiters.remove((agent_id, task_id))
         except ValueError:
-            return
+            return False
+        return True
 
     def _check_baseline_path(self) -> None:
         if self._baseline_path.is_symlink() or (

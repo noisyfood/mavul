@@ -6,12 +6,12 @@ This repository is an early-stage Python agent system for vulnerability discover
 entry point and owns configuration loading and system construction. Core runtime
 coordination belongs in `system/` (`agent_system.py`, `condenser.py`), while
 specialized agent implementations live in `agents/` (`orchestrator.py`,
-`hunter.py`, `reverser.py`, and `reproducer.py`). Keep reusable orchestration
-logic out of `main.py`. The currently empty `memory/` directory is reserved for
-runtime or persistence work; do not commit generated state or secrets there.
+`hunter.py`, `reproducer.py`, and the `reverser/` package). Keep reusable
+orchestration logic out of `main.py`. The ignored `memory/` directory is reserved
+for runtime state; do not commit generated state or secrets there.
 
-There is no test directory yet. Add tests under `tests/`, mirroring source paths,
-for example `tests/agents/test_reverser.py`.
+Tests live under `tests/`; mirror source responsibilities when adding coverage,
+for example `tests/test_reverser_codex.py`.
 
 ## Build, Test, and Development Commands
 
@@ -19,14 +19,14 @@ The project has no packaging or build configuration. Use Python 3.12.
 
 - `python -m compileall main.py agents system` checks all modules for syntax
   errors.
-- `python -m unittest discover -s tests -p "test_*.py"` runs the expected
-  standard-library test suite once tests exist.
-- `python main.py` invokes the intended local entry point. It is currently
-  incomplete, so contributors should not expect a working service until
-  `Config` and `build_system` are implemented.
+- `python -m unittest discover -s tests -p "test_*.py"` runs the offline
+  standard-library test suite.
+- `python main.py --config config.toml` invokes the local entry point. Configure
+  Codex, IDA MCP, and a Device before running a real Reverse Task; Hunter and
+  Reproducer are still placeholders.
 
-`agents/reverser.py` imports `openhands`; document and pin any required package
-before adding further third-party dependencies.
+`agents/reverser/codex.py` integrates `openai-codex`; keep its dependency pin and
+example configuration synchronized with adapter changes.
 
 ## Coding Style & Naming Conventions
 

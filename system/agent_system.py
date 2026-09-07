@@ -1,6 +1,8 @@
 import threading
 from collections.abc import Callable, Iterable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field
+from queue import Empty, Queue
 from typing import Any
 
 from system.agent_runtime import AgentRuntime
@@ -18,6 +20,43 @@ from system.envelope import (
 Registrar = Callable[["AgentSystem", Config], None]
 
 
+class StopCompletion:
+    """Read-only view of one AgentSystem stop attempt."""
+
+    __slots__ = ("__future",)
+
+    def __init__(self, future: Future[None]) -> None:
+        self.__future = future
+
+    def done(self) -> bool:
+        return self.__future.done()
+
+    def cancelled(self) -> bool:
+        return self.__future.cancelled()
+
+    def result(self, timeout: float | None = None) -> None:
+        return self.__future.result(timeout)
+
+    def exception(self, timeout: float | None = None) -> BaseException | None:
+        return self.__future.exception(timeout)
+
+    def add_done_callback(
+        self,
+        callback: Callable[["StopCompletion"], object],
+    ) -> None:
+        self.__future.add_done_callback(lambda _future: callback(self))
+
+
+@dataclass
+class _StopAttempt:
+    future: Future[None] = field(default_factory=Future)
+    completion: StopCompletion = field(init=False)
+    thread: threading.Thread | None = None
+
+    def __post_init__(self) -> None:
+        self.completion = StopCompletion(self.future)
+
+
 class AgentSystem:
     """Route Envelopes and own threads, mailboxes, IDs, and device leases."""
 
@@ -30,11 +69,15 @@ class AgentSystem:
             raise TypeError("AgentSystem requires a parsed Config instance")
         self.config = config
         self._lock = threading.RLock()
+        self._stop_lock = threading.Lock()
         self._agents: dict[str, AgentRuntime] = {}
         self._children: dict[str, Callable[[SystemEnvelope], None]] = {}
         self._child_seen: set[object] = set()
         self._errors: list[tuple[str, Envelope, BaseException]] = []
+        self._control_threads: set[threading.Thread] = set()
+        self._stop_attempt: _StopAttempt | None = None
         self._running = False
+        self._stopping = False
         self._stopped = False
         control_workers = config.get("control_workers", 4)
         if (
@@ -46,6 +89,7 @@ class AgentSystem:
         self._control = ThreadPoolExecutor(
             max_workers=control_workers,
             thread_name_prefix="agent-control",
+            initializer=self._register_control_thread,
         )
         baseline_root = config.get("device_state_dir", "memory/devices")
         self.devices = DeviceRuntime(
@@ -91,6 +135,8 @@ class AgentSystem:
         if stop is not None and not callable(stop):
             raise TypeError("agent stop callback must be callable")
         with self._lock:
+            if self._stopping or self._stopped:
+                raise RuntimeError("cannot register an agent while stopping")
             if name in self._agents or name in self._children:
                 raise ValueError(f"agent already registered: {name}")
             self._agents[name] = AgentRuntime(
@@ -111,6 +157,8 @@ class AgentSystem:
         if not agent_id or not callable(interrupt):
             raise ValueError("child agent requires an ID and interrupt callback")
         with self._lock:
+            if self._stopping or self._stopped:
+                raise RuntimeError("cannot register an agent while stopping")
             if agent_id in self._agents or agent_id in self._children:
                 return False
             self._children[agent_id] = interrupt
@@ -131,6 +179,8 @@ class AgentSystem:
         if not isinstance(envelope, Envelope):
             raise TypeError("AgentSystem accepts Envelope instances")
         with self._lock:
+            if self._stopping or self._stopped:
+                raise RuntimeError("agent system is stopping")
             runtime = self._agents.get(envelope.recipient)
             child = self._children.get(envelope.recipient)
             if child is not None:
@@ -170,8 +220,21 @@ class AgentSystem:
         )
         self.submit(envelope)
 
-    def acquire_device(self, device_id: str, agent_id: str) -> LeaseRequest:
-        return self.devices.acquire(device_id, agent_id)
+    def acquire_device(
+        self,
+        device_id: str,
+        agent_id: str,
+        task_id: str,
+    ) -> LeaseRequest:
+        return self.devices.acquire(device_id, agent_id, task_id)
+
+    def cancel_device_wait(
+        self,
+        device_id: str,
+        agent_id: str,
+        task_id: str,
+    ) -> bool:
+        return self.devices.cancel_waiter(device_id, agent_id, task_id)
 
     def release_device(self, lease: DeviceLease) -> None:
         self.devices.release(lease)
@@ -180,9 +243,15 @@ class AgentSystem:
         self,
         device_id: str,
         target_agent: str,
+        target_task_id: str,
         requested_by: str,
     ) -> DeviceLease:
-        return self.devices.preempt(device_id, target_agent, requested_by)
+        return self.devices.preempt(
+            device_id,
+            target_agent,
+            target_task_id,
+            requested_by,
+        )
 
     def quarantine_device(self, device_id: str, reason: str) -> None:
         self.devices.quarantine(device_id, reason)
@@ -204,30 +273,74 @@ class AgentSystem:
         if "orchestrator" not in self.registered_agents:
             raise RuntimeError("orchestrator is not registered")
         self._running = True
+        lines: Queue[str | None] = Queue()
+
+        def read_input() -> None:
+            while self._running:
+                try:
+                    lines.put(input())
+                except EOFError:
+                    lines.put(None)
+                    return
+
+        threading.Thread(
+            target=read_input,
+            name="agent-system-input",
+            daemon=True,
+        ).start()
         while self._running:
             try:
-                self.send_to_orchestrator(input())
-            except EOFError:
+                line = lines.get(timeout=0.1)
+            except Empty:
+                continue
+            if line is None:
                 break
+            self.send_to_orchestrator(line)
+        self._running = False
 
-    def stop(self) -> None:
-        """Final stop after Orchestrator has interrupted and quiesced Agents."""
-        with self._lock:
-            if self._stopped:
-                return
-            self._stopped = True
-            self._running = False
-            runtimes = list(self._agents.values())
-        failures: list[str] = []
-        for runtime in runtimes:
-            try:
-                runtime.shutdown()
-            except Exception:
-                failures.append(runtime.name)
-        self._control.shutdown(wait=True)
-        if failures:
-            names = ", ".join(failures)
-            raise RuntimeError(f"failed to stop registered agents: {names}")
+    def stop(self) -> StopCompletion:
+        """Request final stop and return its observable completion."""
+        with self._stop_lock:
+            with self._lock:
+                runtimes = tuple(self._agents.values())
+                current = threading.current_thread()
+                managed = current in self._control_threads or any(
+                    runtime.owns_thread(current) for runtime in runtimes
+                )
+                attempt = self._stop_attempt
+                coordinator_callback = (
+                    attempt is not None and current is attempt.thread
+                )
+                if coordinator_callback and not attempt.future.done():
+                    return attempt.completion
+                if self._stopped:
+                    if attempt is None:
+                        raise RuntimeError("stopped system has no stop completion")
+                elif attempt is None or attempt.future.done():
+                    self._stopping = True
+                    self._running = False
+                    attempt = _StopAttempt()
+                    attempt.thread = threading.Thread(
+                        target=self._run_stop_attempt,
+                        args=(attempt,),
+                        name="agent-system-stop",
+                    )
+                    self._stop_attempt = attempt
+                    try:
+                        attempt.thread.start()
+                    except BaseException as exc:
+                        attempt.future.set_exception(exc)
+                        self._stop_attempt = None
+                        raise
+
+        if managed or coordinator_callback:
+            return attempt.completion
+        try:
+            attempt.future.result()
+        finally:
+            if attempt.thread is not None:
+                attempt.thread.join()
+        return attempt.completion
 
     @property
     def errors(self) -> tuple[tuple[str, Envelope, BaseException], ...]:
@@ -238,6 +351,40 @@ class AgentSystem:
         with self._lock:
             if agent_id not in self._agents and agent_id not in self._children:
                 raise LookupError(f"agent is not registered: {agent_id}")
+
+    def _register_control_thread(self) -> None:
+        with self._lock:
+            self._control_threads.add(threading.current_thread())
+
+    def _run_stop_attempt(self, attempt: _StopAttempt) -> None:
+        try:
+            self._perform_stop()
+        except BaseException as exc:
+            attempt.future.set_exception(exc)
+        else:
+            attempt.future.set_result(None)
+
+    def _perform_stop(self) -> None:
+        with self._lock:
+            if self._stopped:
+                return
+            runtimes = tuple(self._agents.values())
+
+        failures: list[tuple[str, BaseException]] = []
+        for runtime in runtimes:
+            try:
+                runtime.shutdown()
+            except BaseException as exc:
+                failures.append((runtime.name, exc))
+        if failures:
+            names = ", ".join(name for name, _error in failures)
+            error = RuntimeError(f"failed to stop registered agents: {names}")
+            raise error from failures[0][1]
+
+        self._control.shutdown(wait=True, cancel_futures=True)
+        with self._lock:
+            self._stopping = False
+            self._stopped = True
 
     def _deliver_control_now(self, envelope: SystemEnvelope) -> None:
         with self._lock:

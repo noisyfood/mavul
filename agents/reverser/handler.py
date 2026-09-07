@@ -1,21 +1,25 @@
-import json
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
+from agents.envelope_handler import EnvelopeHandler
 from system.envelope import (
     Envelope,
-    ResultEnvelope,
     SystemAction,
     SystemEnvelope,
     TaskEnvelope,
 )
 
+from .models import ReverserRequestError
+
 if TYPE_CHECKING:
-    from agents.reverser import Reverser
-    from agents.reverser_types import ReverseTaskResult
+    from .agent import Reverser
+    from .models import ReverseTaskResult
 
 
-class ReverserMailbox:
+_REQUEST_ERRORS = (LookupError, ReverserRequestError, ValueError)
+
+
+class ReverserEnvelopeHandler(EnvelopeHandler):
     """Translate routed Envelopes into Reverser lifecycle calls."""
 
     def __init__(
@@ -24,35 +28,19 @@ class ReverserMailbox:
         submit: Callable[[Envelope], None] | None,
     ) -> None:
         self._reverser = reverser
-        self._submit = submit
-
-    def receive(self, envelope: Envelope) -> None:
-        if isinstance(envelope, TaskEnvelope):
-            if envelope.sender != "orchestrator":
-                raise PermissionError("only Orchestrator may assign Reverser tasks")
-            self._receive_task(envelope)
-            return
-        if isinstance(envelope, SystemEnvelope):
-            if envelope.sender not in {"orchestrator", "agent-system"}:
-                raise PermissionError("unauthorized Reverser lifecycle command")
-            self._receive_system(envelope)
-            return
-        raise TypeError(f"unsupported Reverser Envelope: {type(envelope).__name__}")
+        super().__init__(reverser.agent_id, submit)
 
     def _receive_task(self, envelope: TaskEnvelope) -> None:
         if not envelope.task_id:
             self._emit_error(envelope, "TaskEnvelope requires task_id")
             return
-        instruction = envelope.content
-        if envelope.information:
-            instruction += (
-                "\n\n## Necessary Information\n\n```json\n"
-                + json.dumps(envelope.information, ensure_ascii=False, indent=2)
-                + "\n```"
-            )
         try:
-            result = self._reverser.start_task(envelope.task_id, instruction)
-        except Exception as exc:
+            result = self._reverser.start_task(
+                envelope.task_id,
+                envelope.content,
+                envelope.information,
+            )
+        except _REQUEST_ERRORS as exc:
             self._emit_error(envelope, str(exc))
             return
         self._emit_result(envelope, result)
@@ -62,7 +50,17 @@ class ReverserMailbox:
             if envelope.action == SystemAction.QUERY_TASK:
                 if not envelope.task_id:
                     raise ValueError("query_task requires task_id")
-                summary = self._reverser.query_task(envelope.task_id)
+                try:
+                    summary = self._reverser.query_task(envelope.task_id)
+                except LookupError:
+                    if envelope.arguments.get("accepted_task") is not True:
+                        raise
+                    self._emit_status(
+                        envelope,
+                        "starting",
+                        "Task accepted and waiting to enter the Reverser.",
+                    )
+                    return
                 self._emit_status(envelope, "status", summary)
             elif envelope.action == SystemAction.INTERRUPT_TASK:
                 if not envelope.task_id:
@@ -75,7 +73,10 @@ class ReverserMailbox:
                         "Task was cancelled before execution.",
                     )
                     return
-                summary = self._reverser.interrupt_task(envelope.task_id)
+                summary = self._reverser.interrupt_task(
+                    envelope.task_id,
+                    self._control_order(envelope),
+                )
                 self._emit_status(envelope, "interrupt_processed", summary)
             elif envelope.action == SystemAction.INTERRUPT_AGENT:
                 summary = self._reverser.interrupt_all(
@@ -89,8 +90,17 @@ class ReverserMailbox:
                 if not envelope.task_id:
                     raise ValueError("resume_task requires task_id")
                 notes = str(envelope.arguments.get("notes", "")).strip()
-                result = self._reverser.resume_task(envelope.task_id, notes)
+                result = self._reverser.resume_task(
+                    envelope.task_id,
+                    notes,
+                    self._control_order(envelope),
+                )
                 self._emit_result(envelope, result)
+            elif envelope.action == SystemAction.DEVICE_AVAILABLE:
+                if not envelope.task_id:
+                    raise ValueError("device_available requires task_id")
+                result = self._reverser.device_available(envelope.task_id)
+                self._emit_result(envelope, result, recipient="orchestrator")
             elif envelope.action in {
                 SystemAction.STOP_AGENT,
                 SystemAction.STOP_SYSTEM,
@@ -99,60 +109,31 @@ class ReverserMailbox:
                 self._emit_status(envelope, "stopped", envelope.event)
             else:
                 raise ValueError(f"unsupported Reverser action: {envelope.action}")
-        except Exception as exc:
+        except _REQUEST_ERRORS as exc:
             self._emit_error(envelope, str(exc))
+
+    @staticmethod
+    def _control_order(envelope: SystemEnvelope) -> int | None:
+        order = envelope.arguments.get("runtime_control_order")
+        if isinstance(order, int) and not isinstance(order, bool):
+            return order
+        return None
 
     def _emit_result(
         self,
         request: Envelope,
         result: "ReverseTaskResult",
+        recipient: str | None = None,
     ) -> None:
         artifacts = ()
         if result.status == "ready_to_deliver":
             artifacts = (f"{result.task_id}/analysis/behavior-model.md",)
-        self._emit(
-            ResultEnvelope(
-                sender="reverser",
-                recipient=request.sender,
-                task_id=result.task_id,
-                correlation_id=request.envelope_id,
-                agent_signature="reverser",
-                status=result.status,
-                summary=self._summary(result.output),
-                artifacts=artifacts,
-            )
+        submitted = self._emit_status(
+            request,
+            result.status,
+            result.output,
+            artifacts,
+            recipient,
         )
-        if result.status == "ready_to_deliver" and self._submit is not None:
+        if result.status == "ready_to_deliver" and submitted:
             self._reverser.mark_delivered(result.task_id)
-
-    def _emit_status(
-        self,
-        request: Envelope,
-        status: str,
-        summary: str,
-    ) -> None:
-        self._emit(
-            ResultEnvelope(
-                sender="reverser",
-                recipient=request.sender,
-                task_id=request.task_id,
-                correlation_id=request.envelope_id,
-                agent_signature="reverser",
-                status=status,
-                summary=self._summary(summary),
-            )
-        )
-
-    def _emit_error(self, request: Envelope, summary: str) -> None:
-        self._emit_status(request, "error", summary)
-
-    def _emit(self, envelope: ResultEnvelope) -> None:
-        if self._submit is not None:
-            self._submit(envelope)
-
-    @staticmethod
-    def _summary(content: str, limit: int = 240) -> str:
-        summary = " ".join(content.split())
-        if len(summary) <= limit:
-            return summary
-        return summary[: limit - 1].rstrip() + "…"

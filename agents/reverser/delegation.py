@@ -5,7 +5,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from agents.reverser_types import ReverseTask
+from .models import ReverseTask
+from .workspace import ReverserWorkspace
 
 
 @dataclass
@@ -43,9 +44,9 @@ class DelegationRegistry:
         if self._register_child is None:
             raise RuntimeError("nested Agent registration is not connected")
         encoded_metadata = json.dumps(dict(metadata or {}), ensure_ascii=False)
-        child_root = task.workspace / "delegated" / child_name
+        child_root = task.work_dir / "delegated" / child_name
         if child_root.is_symlink() or not child_root.resolve().is_relative_to(
-            task.workspace.resolve()
+            task.work_dir.resolve()
         ):
             raise RuntimeError("nested workspace must remain under task workspace")
         with self._lock:
@@ -75,7 +76,7 @@ class DelegationRegistry:
                 child_id=child_id,
                 parent_task_id=task.task_id,
                 generation=generation,
-                workspace=str(workspace.relative_to(task.workspace)),
+                workspace=str(workspace.relative_to(task.work_dir)),
                 status="running",
                 metadata=json.loads(encoded_metadata),
             )
@@ -124,9 +125,7 @@ class DelegationRegistry:
             if item.parent_task_id == task.task_id
         ]
         path = task.workspace / "delegated" / "manifest.json"
-        temporary = path.with_suffix(".json.tmp")
-        temporary.write_text(
+        ReverserWorkspace.atomic_write(
+            path,
             json.dumps(manifests, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
         )
-        temporary.replace(path)

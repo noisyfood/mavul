@@ -1,22 +1,22 @@
 import tempfile
 import unittest
-import uuid
 from pathlib import Path
 
-from agents.reverser_delegation import DelegationRegistry
-from agents.reverser_types import ReverseTask
+from agents.reverser.delegation import DelegationRegistry
+from agents.reverser.models import ReverseTask
 
 
 class DelegationRegistryTest(unittest.TestCase):
     def test_registers_unique_nested_id_and_persists_manifest(self):
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
+            (workspace / "work" / "delegated").mkdir(parents=True)
             (workspace / "delegated").mkdir()
             task = ReverseTask(
                 task_id="task-1",
                 objective="Map parser",
                 workspace=workspace,
-                conversation_id=uuid.uuid4(),
+                session_id="thread-opaque-1",
             )
             registered = []
             unregistered = []
@@ -37,6 +37,7 @@ class DelegationRegistryTest(unittest.TestCase):
 
         self.assertEqual(registered, ["task-1.callee.1", "task-1.callee.2"])
         self.assertEqual(manifest.child_id, "task-1.callee.2")
+        self.assertEqual(manifest.workspace, "delegated/callee/2")
         self.assertEqual(loaded[0].status, "complete")
         self.assertEqual(unregistered, [manifest.child_id])
 

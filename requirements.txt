@@ -1,2 +1,1 @@
-openhands-sdk==1.37.1
-openhands-tools==1.37.1
+openai-codex==0.147.0

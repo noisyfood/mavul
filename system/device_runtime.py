@@ -37,10 +37,16 @@ class DeviceRuntime:
     def ids(self) -> tuple[str, ...]:
         return self._manager.ids
 
-    def acquire(self, device_id: str, agent_id: str) -> LeaseRequest:
+    def acquire(
+        self,
+        device_id: str,
+        agent_id: str,
+        task_id: str,
+    ) -> LeaseRequest:
         self._require_agent(agent_id)
         return self.get(device_id).acquire(
             agent_id,
+            task_id,
             allow_quarantined=agent_id == self._recovery_agent_id,
         )
 
@@ -49,28 +55,42 @@ class DeviceRuntime:
         if next_lease is not None:
             self._notify_available(next_lease)
 
+    def cancel_waiter(
+        self,
+        device_id: str,
+        agent_id: str,
+        task_id: str,
+    ) -> bool:
+        self._require_agent(agent_id)
+        return self.get(device_id).cancel_waiter(agent_id, task_id)
+
     def preempt(
         self,
         device_id: str,
         target_agent: str,
+        target_task_id: str,
         requested_by: str,
     ) -> DeviceLease:
         if requested_by != "orchestrator":
             raise PermissionError("only Orchestrator may preempt a device")
         self._require_agent(target_agent)
         device = self.get(device_id)
-        previous = device.lease.agent_id if device.lease else None
-        if previous is not None and previous != target_agent:
+        previous = device.lease
+        if previous is not None and (
+            previous.agent_id,
+            previous.task_id,
+        ) != (target_agent, target_task_id):
             self._deliver_control(
                 SystemEnvelope(
                     sender="agent-system",
-                    recipient=previous,
+                    recipient=previous.agent_id,
+                    task_id=previous.task_id,
                     event="device lease preempted",
                     action=SystemAction.DEVICE_PREEMPTED,
                     arguments={"device_id": device_id},
                 )
             )
-        _, lease = device.preempt(target_agent)
+        _, lease = device.preempt(target_agent, target_task_id)
         self._notify_available(lease)
         return lease
 
@@ -80,7 +100,8 @@ class DeviceRuntime:
             self._submit(
                 SystemEnvelope(
                     sender="agent-system",
-                    recipient=previous,
+                    recipient=previous.agent_id,
+                    task_id=previous.task_id,
                     event="device quarantined",
                     action=SystemAction.DEVICE_QUARANTINED,
                     details={"reason": reason},
@@ -115,6 +136,7 @@ class DeviceRuntime:
             SystemEnvelope(
                 sender="agent-system",
                 recipient=lease.agent_id,
+                task_id=lease.task_id,
                 event="device available",
                 action=SystemAction.DEVICE_AVAILABLE,
                 arguments={
